@@ -998,6 +998,7 @@ class LazySupervisedDataset(Dataset):
     def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
+        self.data_args = data_args
         self.list_data_dict = []
         self.video_processor = VideoProcessor(
             data_args.video_folder,
@@ -1099,7 +1100,6 @@ class LazySupervisedDataset(Dataset):
                 )
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
-        self.data_args = data_args
 
     def __len__(self):
         return len(self.list_data_dict)
