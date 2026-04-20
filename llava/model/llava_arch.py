@@ -210,6 +210,66 @@ class LlavaMetaForCausalLM(ABC):
         return image_feature
 
 
+    class JEPA3DPatchAdapter(nn.Module):
+        def __init__(self, hidden_size, point_dim=256):
+            super().__init__()
+            self.point_proj = nn.Linear(point_dim, hidden_size)
+            self.coord_proj = nn.Linear(3, hidden_size)
+            self.q_proj = nn.Linear(hidden_size, hidden_size)
+            self.k_proj = nn.Linear(hidden_size, hidden_size)
+            self.v_proj = nn.Linear(hidden_size, hidden_size)
+            self.out_proj = nn.Linear(hidden_size, hidden_size)
+            self.scale = hidden_size ** -0.5
+
+        def forward(self, image_features, point_features, point_coords):
+            if image_features.dim() == 3:
+                batch_shape = image_features.shape[:-1]
+                flattened = image_features.view(-1, image_features.shape[-1])
+                adapted = self._forward_flat(flattened, point_features, point_coords)
+                return adapted.view(*batch_shape, image_features.shape[-1])
+            if image_features.dim() == 2:
+                return self._forward_flat(image_features, point_features, point_coords)
+            raise ValueError(f"Unsupported image feature shape {image_features.shape}")
+
+        def _forward_flat(self, queries, point_features, point_coords):
+            point_features = point_features.to(queries.dtype)
+            point_coords = point_coords.to(queries.dtype)
+            point_emb = self.point_proj(point_features) + self.coord_proj(point_coords)
+            q = self.q_proj(queries)
+            k = self.k_proj(point_emb)
+            v = self.v_proj(point_emb)
+            attn = torch.softmax(torch.matmul(q, k.transpose(-1, -2)) * self.scale, dim=-1)
+            out = torch.matmul(attn, v)
+            return queries + self.out_proj(out)
+
+    def apply_jepa_patch_adapter(self, image_features, video_dict):
+        if image_features is None or video_dict is None:
+            return image_features
+        if "jepa_features" not in video_dict or "jepa_coords" not in video_dict:
+            return image_features
+
+        if not hasattr(self, "jepa_patch_adapter"):
+            hidden_size = getattr(self.get_model().config, "hidden_size", None)
+            if hidden_size is None:
+                hidden_size = image_features[0].shape[-1] if isinstance(image_features, list) else image_features.shape[-1]
+            self.jepa_patch_adapter = self.JEPA3DPatchAdapter(hidden_size)
+
+        def adapt_sample(image_feat, sample_idx):
+            point_feat = video_dict["jepa_features"][sample_idx].to(image_feat.device)
+            point_coord = video_dict["jepa_coords"][sample_idx].to(image_feat.device)
+            return self.jepa_patch_adapter(image_feat, point_feat, point_coord)
+
+        if isinstance(image_features, list):
+            adapted = []
+            for sample_idx, image_feat in enumerate(image_features):
+                if sample_idx >= video_dict["jepa_features"].shape[0]:
+                    adapted.append(image_feat)
+                else:
+                    adapted.append(adapt_sample(image_feat, sample_idx))
+            return adapted
+
+        return adapt_sample(image_features, 0)
+
     def average_coordinate_in_patch(self, world_coords, patch_size=27):
 
         V, H, W, D = world_coords.size() # D = 3
@@ -516,6 +576,7 @@ class LlavaMetaForCausalLM(ABC):
                     new_image_features.append(image_feat)
                 image_features = new_image_features
 
+            image_features = self.apply_jepa_patch_adapter(image_features, video_dict)
 
             if mm_patch_merge_type == "flat":
                 image_features = [x.flatten(0, 1) for x in image_features]

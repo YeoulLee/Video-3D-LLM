@@ -362,7 +362,7 @@ def merge_video_dict(video_dict_list):
     new_video_dict = {}
     new_video_dict['box_input'] = []
     for k in video_dict_list[0]:
-        if k in ["world_coords", 'images', 'objects']:
+        if k in ["world_coords", 'images', 'objects', 'jepa_features', 'jepa_coords']:
             new_video_dict[k] = torch.stack([video_dict[k] for video_dict in video_dict_list])
         elif k in ['box_input']:
             for video_dict in video_dict_list:

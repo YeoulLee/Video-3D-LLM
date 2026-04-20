@@ -137,6 +137,7 @@ class DataArguments:
 
     embodiedscan_folder: Optional[str] = field(default=None)
     video_folder: Optional[str] = field(default=None)
+    jepa_feature_folder: Optional[str] = field(default=None)
     video_fps: Optional[int] = field(default=1)
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
@@ -1251,6 +1252,20 @@ class LazySupervisedDataset(Dataset):
                     force_sample=self.data_args.force_sample,
                     frames_upbound=self.data_args.frames_upbound,
                 )
+                if getattr(self.data_args, "jepa_feature_folder", None):
+                    scene_name = video_file
+                    jepa_path = os.path.join(self.data_args.jepa_feature_folder, *scene_name.split("/")) + ".pt"
+                    if os.path.exists(jepa_path):
+                        jepa_data = torch.load(jepa_path)
+                        if isinstance(jepa_data, dict):
+                            video_dict["jepa_features"] = jepa_data.get("features", jepa_data.get("jepa_features"))
+                            video_dict["jepa_coords"] = jepa_data.get("coords", jepa_data.get("points"))
+                        elif isinstance(jepa_data, (tuple, list)) and len(jepa_data) >= 2:
+                            video_dict["jepa_features"], video_dict["jepa_coords"] = jepa_data[0], jepa_data[1]
+                        else:
+                            raise ValueError(f"Unsupported JEPA feature format: {jepa_path}")
+                    else:
+                        raise FileNotFoundError(f"JEPA feature file not found: {jepa_path}")
                 image = video_dict.pop("images")
                 video_size = video_dict.pop("video_size")
                 video_dict["box_input"] = box_input
