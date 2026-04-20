@@ -1080,6 +1080,23 @@ class LazySupervisedDataset(Dataset):
                 self.list_data_dict.extend(cur_data_dict)
 
         rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
+        if getattr(self.data_args, "jepa_feature_folder", None):
+            filtered_data_dict = []
+            for sample in self.list_data_dict:
+                if "video" in sample:
+                    scene_name = sample["video"]
+                    jepa_path = os.path.join(self.data_args.jepa_feature_folder, *scene_name.split("/")) + ".pt"
+                    if os.path.exists(jepa_path):
+                        filtered_data_dict.append(sample)
+                else:
+                    filtered_data_dict.append(sample)
+            removed = len(self.list_data_dict) - len(filtered_data_dict)
+            self.list_data_dict = filtered_data_dict
+            rank0_print(f"Filtered {removed} samples without JEPA features; {len(self.list_data_dict)} samples remain.")
+            if len(self.list_data_dict) == 0:
+                raise ValueError(
+                    f"No samples remain after filtering for JEPA features in {self.data_args.jepa_feature_folder}."
+                )
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.data_args = data_args
