@@ -1086,7 +1086,8 @@ class LazySupervisedDataset(Dataset):
             for sample in self.list_data_dict:
                 if "video" in sample:
                     scene_name = sample["video"]
-                    jepa_path = os.path.join(self.data_args.jepa_feature_folder, *scene_name.split("/")) + ".pt"
+                    scene_id = scene_name.split("/")[-1]
+                    jepa_path = os.path.join(self.data_args.jepa_feature_folder, scene_id) + ".pt"
                     if os.path.exists(jepa_path):
                         filtered_data_dict.append(sample)
                 else:
@@ -1271,7 +1272,8 @@ class LazySupervisedDataset(Dataset):
                 )
                 if getattr(self.data_args, "jepa_feature_folder", None):
                     scene_name = video_file
-                    jepa_path = os.path.join(self.data_args.jepa_feature_folder, *scene_name.split("/")) + ".pt"
+                    scene_id = scene_name.split("/")[-1]
+                    jepa_path = os.path.join(self.data_args.jepa_feature_folder, scene_id) + ".pt"
                     if os.path.exists(jepa_path):
                         jepa_data = torch.load(jepa_path)
                         if isinstance(jepa_data, dict):
