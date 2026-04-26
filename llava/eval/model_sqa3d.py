@@ -153,6 +153,22 @@ def eval_model(questions, args):
             force_sample=args.force_sample,
             frames_upbound=args.max_frame_num,
         )
+
+        if args.jepa_feature_folder is not None:
+            scene_id = video_id.split("/")[-1]
+            jepa_path = os.path.join(args.jepa_feature_folder, scene_id) + ".pt"
+            if os.path.exists(jepa_path):
+                jepa_data = torch.load(jepa_path, map_location="cpu")
+                if isinstance(jepa_data, dict):
+                    video_dict["jepa_features"] = jepa_data.get("features", jepa_data.get("jepa_features"))
+                    video_dict["jepa_coords"] = jepa_data.get("coords", jepa_data.get("points"))
+                elif isinstance(jepa_data, (tuple, list)) and len(jepa_data) >= 2:
+                    video_dict["jepa_features"], video_dict["jepa_coords"] = jepa_data[0], jepa_data[1]
+                else:
+                    raise ValueError(f"Unsupported JEPA feature format: {jepa_path}")
+            else:
+                print(f"[warn] JEPA feature file not found, skipping JEPA adapter for this sample: {jepa_path}")
+
         video_dict = merge_video_dict([video_dict])
         image_tensors = video_dict.pop('images').half().to(model.device)
         for k in video_dict:
@@ -219,6 +235,7 @@ if __name__ == "__main__":
     parser.add_argument("--force_sample", type=bool, default=True)
     parser.add_argument("--overwrite_cfg", type=bool, default=False)
     parser.add_argument("--lora-path", type=str, default=None)
+    parser.add_argument("--jepa-feature-folder", type=str, default=None)
     args = parser.parse_args()
 
     # Data

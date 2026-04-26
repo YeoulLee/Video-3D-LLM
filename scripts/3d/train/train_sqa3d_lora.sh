@@ -40,7 +40,10 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --embodiedscan_folder data/embodiedscan/ \
     --jepa_feature_folder $JEPA_FEATURE_FOLDER \
     --lora_enable True \
-    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
+    --lora_r 128 \
+    --lora_alpha 256 \
+    --lora_dropout 0.05 \
+    --mm_tunable_parts="mm_mlp_adapter,mm_language_model" \
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \

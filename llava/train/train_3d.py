@@ -1792,9 +1792,26 @@ def train(attn_implementation=None):
         ### Deciding train which part of the model
         if training_args.lora_enable:
             # We update embed_tokens as the size of embedding has changed.
+            # jepa_patch_adapter is fully fine-tuned in LoRA mode (it is not a LoRA target).
             for name, param in model.named_parameters():
-                if "embed_tokens" in name or "lora_" in name:
+                if "embed_tokens" in name or "lora_" in name or "jepa_patch_adapter" in name:
                     param.requires_grad_(True)
+            # Honor mm_tunable_parts in LoRA mode for non-LLM modules.
+            # mm_language_model is intentionally skipped here since LoRA already covers the LLM linears.
+            if model_args.mm_tunable_parts is not None:
+                rank0_print(f"Using mm_tunable_parts (LoRA mode, mm_language_model handled by LoRA): {model_args.mm_tunable_parts}")
+                model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
+                tunable_parts = model_args.mm_tunable_parts.split(",")
+                if "mm_mlp_adapter" in tunable_parts:
+                    for p in model.get_model().mm_projector.parameters():
+                        p.requires_grad = True
+                if "mm_vision_resampler" in tunable_parts:
+                    for p in model.get_model().vision_resampler.parameters():
+                        p.requires_grad = True
+                if "mm_vision_tower" in tunable_parts:
+                    for n, p in model.named_parameters():
+                        if "vision_tower" in n:
+                            p.requires_grad_(True)
         else:
             if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
                 model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
