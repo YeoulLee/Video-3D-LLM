@@ -108,8 +108,22 @@ def eval_model(questions, args):
 
         model = PeftModel.from_pretrained(model, args.lora_path, adapter_name="lora")
         model = model.merge_and_unload()
-        state_dict = torch.load(os.path.join(args.lora_path, 'non_lora_trainables.bin'))
+        state_dict = torch.load(os.path.join(args.lora_path, 'non_lora_trainables.bin'), map_location="cpu")
+        # Cast to the live model's dtype so bf16-trained tensors match an fp16/bf16 model.
+        state_dict = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in state_dict.items()}
         msg = model.load_state_dict(state_dict, strict=False)
+        relevant_missing = [k for k in msg.missing_keys if any(s in k for s in ("jepa_projector", "jepa_patch_adapter", "world_position_embedding", "ground_head"))]
+        if msg.unexpected_keys:
+            print(f"[non_lora_trainables] unexpected keys ({len(msg.unexpected_keys)}): {msg.unexpected_keys[:5]}{' ...' if len(msg.unexpected_keys) > 5 else ''}")
+        if relevant_missing:
+            print(f"[non_lora_trainables] WARNING - critical missing keys: {relevant_missing[:10]}{' ...' if len(relevant_missing) > 10 else ''}")
+
+    use_jepa_only = bool(getattr(model.config, "use_jepa_only", False))
+    if use_jepa_only and args.jepa_feature_folder is None:
+        raise ValueError(
+            "Loaded checkpoint has use_jepa_only=True but --jepa-feature-folder was not provided. "
+            "JEPA-only inference requires the same feature folder as training."
+        )
     
     answer_file = os.path.expanduser(args.answer_file)
     os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -167,6 +181,23 @@ def eval_model(questions, args):
                 else:
                     raise ValueError(f"Unsupported JEPA feature format: {jepa_path}")
             else:
+                if use_jepa_only:
+                    # In JEPA-only mode the model has no fallback visual signal, so we must
+                    # skip this sample rather than crash the whole eval run.
+                    print(f"[skip] JEPA-only run but JEPA features missing for {video_id} ({jepa_path}); writing empty prediction.")
+                    with file_lock:
+                        ans_file.write(json.dumps({
+                            "dataset": dataset_name,
+                            "sample_id": idx,
+                            "prompt": cur_prompt,
+                            "pred_response": "",
+                            "gt_response": gt,
+                            "model_id": model_name,
+                            "question_type": question_type,
+                            "skipped_reason": "missing_jepa_feature",
+                        }) + "\n")
+                        ans_file.flush()
+                    continue
                 print(f"[warn] JEPA feature file not found, skipping JEPA adapter for this sample: {jepa_path}")
 
         video_dict = merge_video_dict([video_dict])

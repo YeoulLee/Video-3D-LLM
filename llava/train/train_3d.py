@@ -122,6 +122,12 @@ class ModelArguments:
     ground_loss_scale: Optional[int] = field(default=1)
     ground_head_temperature: Optional[float] = field(default=0.07)
 
+    use_jepa_only: bool = field(default=False, metadata={"help": "If True, skip SigLIP and feed JEPA features directly as visual tokens via jepa_projector."})
+    jepa_only_projector_type: Optional[str] = field(default="linear", metadata={"help": "Projector type for use_jepa_only mode. One of {'linear', 'transformer'}."})
+    jepa_only_num_layers: int = field(default=2, metadata={"help": "Transformer encoder layers for jepa_only_projector_type='transformer'."})
+    jepa_only_num_heads: int = field(default=8, metadata={"help": "Attention heads for jepa_only_projector_type='transformer'."})
+    jepa_only_use_view_token: bool = field(default=True, metadata={"help": "Prepend a learnable [VIEW] token (biased by agent anchor) for SQA3D situation."})
+
 
 @dataclass
 class DataArguments:
@@ -1499,6 +1505,13 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["ground_loss_scale"] = model_args.ground_loss_scale
         overwrite_config["ground_head_temperature"] = model_args.ground_head_temperature
 
+    if model_args.use_jepa_only:
+        overwrite_config["use_jepa_only"] = True
+        overwrite_config["jepa_only_projector_type"] = model_args.jepa_only_projector_type
+        overwrite_config["jepa_only_num_layers"] = model_args.jepa_only_num_layers
+        overwrite_config["jepa_only_num_heads"] = model_args.jepa_only_num_heads
+        overwrite_config["jepa_only_use_view_token"] = model_args.jepa_only_use_view_token
+
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
 
@@ -1792,9 +1805,14 @@ def train(attn_implementation=None):
         ### Deciding train which part of the model
         if training_args.lora_enable:
             # We update embed_tokens as the size of embedding has changed.
-            # jepa_patch_adapter is fully fine-tuned in LoRA mode (it is not a LoRA target).
+            # jepa_patch_adapter / jepa_projector are fully fine-tuned in LoRA mode (not LoRA targets).
             for name, param in model.named_parameters():
-                if "embed_tokens" in name or "lora_" in name or "jepa_patch_adapter" in name:
+                if (
+                    "embed_tokens" in name
+                    or "lora_" in name
+                    or "jepa_patch_adapter" in name
+                    or "jepa_projector" in name
+                ):
                     param.requires_grad_(True)
             # Honor mm_tunable_parts in LoRA mode for non-LLM modules.
             # mm_language_model is intentionally skipped here since LoRA already covers the LLM linears.

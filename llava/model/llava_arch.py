@@ -64,6 +64,98 @@ class JEPA3DPatchAdapter(nn.Module):
         return queries + self.out_proj(out)
 
 
+class JEPAOnlyProjector(nn.Module):
+    """Linear baseline: maps (point feature, 3D coord) pairs to LLM hidden space.
+
+    Each point is processed independently. Used as the simplest JEPA-only baseline
+    so that any downstream gains from heavier projectors can be attributed cleanly.
+    """
+
+    def __init__(self, hidden_size, point_dim=256):
+        super().__init__()
+        self.point_proj = nn.Sequential(
+            nn.Linear(point_dim, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.coord_proj = nn.Sequential(
+            nn.Linear(3, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(self, point_features, point_coords):
+        point_features = point_features.to(self.point_proj[0].weight.dtype)
+        point_coords = point_coords.to(self.coord_proj[0].weight.dtype)
+        return self.point_proj(point_features) + self.coord_proj(point_coords)
+
+
+class JEPATransformerProjector(nn.Module):
+    """Transformer-based JEPA projector with self-attention across points.
+
+    The 3D coordinate signal is injected as an additive PE pre-computed by the
+    parent model's ``world_position_embedding`` (sin3d), so the spatial
+    representation stays consistent with the SigLIP path. An optional learnable
+    ``[VIEW]`` token, biased by the agent's situation anchor, is prepended so
+    that the LLM directly sees an egocentric reference for SQA3D.
+    """
+
+    def __init__(
+        self,
+        hidden_size,
+        point_dim=256,
+        num_layers=2,
+        num_heads=8,
+        use_view_token=True,
+        ffn_mult=4,
+        dropout=0.0,
+    ):
+        super().__init__()
+        self.point_proj = nn.Linear(point_dim, hidden_size)
+        self.input_norm = nn.LayerNorm(hidden_size)
+
+        self.use_view_token = use_view_token
+        if use_view_token:
+            self.view_query = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=ffn_mult * hidden_size,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+    def forward(self, point_features, point_coord_pe, view_token_pe=None):
+        """
+        point_features: (B, N, point_dim)
+        point_coord_pe: (B, N, hidden_size) - precomputed sin3d coord PE
+        view_token_pe:  (B, hidden_size) or None - agent anchor PE; ignored if
+                        ``use_view_token`` is False or anchor is unavailable.
+        Returns: (B, N or 1+N, hidden_size)
+        """
+        dtype = self.point_proj.weight.dtype
+        point_features = point_features.to(dtype)
+        point_coord_pe = point_coord_pe.to(dtype)
+
+        x = self.point_proj(point_features) + point_coord_pe
+        x = self.input_norm(x)
+
+        if self.use_view_token and view_token_pe is not None:
+            B = x.shape[0]
+            view_tok = self.view_query.expand(B, -1, -1).clone()
+            view_pe = view_token_pe.to(dtype)
+            if view_pe.dim() == 2:
+                view_pe = view_pe.unsqueeze(1)
+            view_tok = view_tok + view_pe
+            x = torch.cat([view_tok, x], dim=1)
+
+        return self.encoder(x)
+
+
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -97,7 +189,22 @@ class LlavaMetaModel:
             # elif "slp" in self.config.world_position_embedding_type:
             #     self.world_position_embedding = PositionEmbeddingSine3DMLP(config.hidden_size, n_points=n_points)
 
-            self.jepa_patch_adapter = JEPA3DPatchAdapter(config.hidden_size)
+            use_jepa_only = getattr(self.config, "use_jepa_only", False)
+            if use_jepa_only:
+                projector_type = getattr(self.config, "jepa_only_projector_type", "linear")
+                if projector_type == "transformer":
+                    self.jepa_projector = JEPATransformerProjector(
+                        hidden_size=config.hidden_size,
+                        num_layers=getattr(self.config, "jepa_only_num_layers", 2),
+                        num_heads=getattr(self.config, "jepa_only_num_heads", 8),
+                        use_view_token=getattr(self.config, "jepa_only_use_view_token", True),
+                    )
+                elif projector_type == "linear":
+                    self.jepa_projector = JEPAOnlyProjector(config.hidden_size)
+                else:
+                    raise ValueError(f"Unknown jepa_only_projector_type: {projector_type}")
+            else:
+                self.jepa_patch_adapter = JEPA3DPatchAdapter(config.hidden_size)
             
 
     def get_vision_tower(self):
@@ -244,6 +351,60 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.view(num_frames, -1, num_dim)
         return image_feature
 
+
+    def encode_jepa_only(self, video_dict):
+        """JEPA-only visual encoding path.
+
+        Builds visual tokens from JEPA features alone (skipping SigLIP). Dispatches
+        between the linear baseline ``JEPAOnlyProjector`` and the heavier
+        ``JEPATransformerProjector``; the latter receives a pre-computed sin3d
+        coord PE (re-using the parent model's ``world_position_embedding``) plus an
+        optional agent-anchor PE for the ``[VIEW]`` token.
+
+        Returns a list of length B, each tensor of shape (N or 1+N, hidden_size).
+        """
+        if video_dict is None or "jepa_features" not in video_dict or "jepa_coords" not in video_dict:
+            raise ValueError("encode_jepa_only requires both 'jepa_features' and 'jepa_coords' in video_dict")
+
+        projector = getattr(self.get_model(), "jepa_projector", None)
+        if projector is None:
+            raise RuntimeError("jepa_projector is not initialized; check that config.use_jepa_only is set")
+
+        jepa_features = video_dict["jepa_features"]   # (B, N, point_dim)
+        jepa_coords = video_dict["jepa_coords"]        # (B, N, 3)
+
+        if isinstance(projector, JEPATransformerProjector):
+            wpe_module = getattr(self.get_model(), "world_position_embedding", None)
+            if wpe_module is None:
+                raise RuntimeError(
+                    "JEPATransformerProjector requires world_position_embedding; "
+                    "set --world_position_embedding_type to a sin3d/mlp variant."
+                )
+
+            wpe_type = getattr(self.config, "world_position_embedding_type", "")
+            if "discrete" in wpe_type:
+                B = jepa_coords.shape[0]
+                xyz_min = jepa_coords.view(B, -1, 3).min(dim=1)[0]
+                coords_for_pe = torch.stack(
+                    [self.discrete_coords(jepa_coords[b], xyz_min[b]) for b in range(B)]
+                )
+            else:
+                coords_for_pe = jepa_coords
+            coord_pe = wpe_module(coords_for_pe.detach())   # (B, N, hidden)
+
+            view_token_pe = None
+            box_input = video_dict.get("box_input")
+            if box_input is not None and len(box_input) > 0:
+                anchor = box_input
+                if "discrete" in wpe_type:
+                    anchor = self.discrete_coords(anchor, None)
+                view_token_pe = wpe_module(anchor.unsqueeze(1).detach()).squeeze(1)  # (B, hidden)
+
+            projected = projector(jepa_features, coord_pe, view_token_pe=view_token_pe)
+        else:
+            projected = projector(jepa_features, jepa_coords)
+
+        return [projected[b] for b in range(projected.shape[0])]
 
     def apply_jepa_patch_adapter(self, image_features, video_dict):
         if image_features is None or video_dict is None:
@@ -490,215 +651,221 @@ class LlavaMetaForCausalLM(ABC):
                 use_mlp_pe = True
 
 
-        vision_tower = self.get_vision_tower()
-        # rank_print(modalities)
-        if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None
-
-        if isinstance(modalities, str):
-            modalities = [modalities]
-
-        # import pdb; pdb.set_trace()
-        if type(images) is list or images.ndim == 5:
-            if type(images) is list:
-                images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
-
-            video_idx_in_batch = []
-            for _ in range(len(modalities)):
-                if modalities[_] == "video":
-                    video_idx_in_batch.append(_)
-
-            images_list = []
-            for image in images:
-                if image.ndim == 4:
-                    images_list.append(image)
-                else:
-                    images_list.append(image.unsqueeze(0))
-
-            concat_images = torch.cat([image for image in images_list], dim=0)
-            split_sizes = [image.shape[0] for image in images_list]
-            encoded_image_features = self.encode_images(concat_images)
-
-            # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
-
-            # This is a list, each element is [num_images, patch * patch, dim]
-            # rank_print(f"Concat images : {concat_images.shape}")
-            encoded_image_features = torch.split(encoded_image_features, split_sizes)
-            image_features = []
-            for idx, image_feat in enumerate(encoded_image_features):
-                if idx in video_idx_in_batch:
-                    image_features.append(self.get_2dPool(image_feat))
-                else:
-                    image_features.append(image_feat)
-            # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
-            # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
-            # image_features = torch.split(image_features, split_sizes, dim=0)
-            mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
-            image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
-            mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
-
-            if use_object_proposals:
-                object_features = []
-                valid_obj_num = 0
-                for l in range(obj_num):
-                    # print(f"image_featurs: {image_features[0].shape}")
-                    # print(f"object_patch: {object_patch[l].shape}")
-                    if "patch27" in self.config.object_feature_type:
-                        cur_object_features = image_features[0][object_patch[l].view(-1, 196)]
-                    elif "patch14" in self.config.object_feature_type:
-                        cur_object_features = encoded_image_features[0][object_patch[l].view(-1, 729)]
-                    else:
-                        raise NotImplementedError
-
-                    if len(cur_object_features) == 0:
-                        cur_object_features = torch.zeros(image_features[0].shape[-1]).to(image_features[0].device)
-                    else:
-                        cur_object_features = cur_object_features.mean(dim=0)
-                        valid_obj_num += 1
-                    object_features.append(cur_object_features)
-                object_features = torch.stack(object_features)
-                if use_mlp_pe or use_sin3d_pe:
-                    box_center_features = self.get_model().world_position_embedding(object_boxes_center.unsqueeze(0)).squeeze(0)      
-                    object_features += box_center_features
-            else:
-                object_features =  None
-
-            
-            if use_sin3d_pe or use_mlp_pe:
-                new_image_features = []
-                for idx, image_feat in enumerate(image_features):
-                    if "discrete" in self.config.world_position_embedding_type:
-                        coords = world_coords_discrete[idx].flatten(1, 2)
-                    else:
-                        coords = world_coords[idx].flatten(1, 2)
-                        
-
-                    image_feat = image_feat + self.get_model().world_position_embedding(coords.detach())
-                    new_image_features.append(image_feat)
-                image_features = new_image_features
-
-            image_features = self.apply_jepa_patch_adapter(image_features, video_dict)
-
-            if mm_patch_merge_type == "flat":
-                image_features = [x.flatten(0, 1) for x in image_features]
-
-            elif mm_patch_merge_type.startswith("spatial"):
-                new_image_features = []
-                for image_idx, image_feature in enumerate(image_features):
-                    # FIXME: now assume the image is square, and split to 2x2 patches
-                    # num_patches = h * w, where h = w = sqrt(num_patches)
-                    # currently image_feature is a tensor of shape (4, num_patches, hidden_size)
-                    # we want to first unflatten it to (2, 2, h, w, hidden_size)
-                    # rank0_print("At least we are reaching here")
-                    # import pdb; pdb.set_trace()
-                    if image_idx in video_idx_in_batch:  # video operations
-                        # rank0_print("Video")
-                        if mm_newline_position == "grid":
-                            # Grid-wise
-                            image_feature = self.add_token_per_grid(image_feature)
-                            if getattr(self.config, "add_faster_video", False):
-                                faster_video_feature = self.add_token_per_grid(all_faster_video_features[image_idx])
-                                # Add a token for each frame
-                                concat_slow_fater_token = []
-                                # import pdb; pdb.set_trace()
-                                for _ in range(image_feature.shape[0]):
-                                    if _ % self.config.faster_token_stride == 0:
-                                        concat_slow_fater_token.append(torch.cat((image_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
-                                    else:
-                                        concat_slow_fater_token.append(torch.cat((faster_video_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
-                                # import pdb; pdb.set_trace()
-                                image_feature = torch.cat(concat_slow_fater_token)
-
-                                # print("!!!!!!!!!!!!")
-                        
-                            new_image_features.append(image_feature)
-                        elif mm_newline_position == "frame":
-                            # Frame-wise
-                            image_feature = self.add_token_per_frame(image_feature)
-
-                            new_image_features.append(image_feature.flatten(0, 1))
-                            
-                        elif mm_newline_position == "one_token":
-                            # one-token
-                            image_feature = image_feature.flatten(0, 1)
-                            if 'unpad' in mm_patch_merge_type:
-                                image_feature = torch.cat((
-                                    image_feature,
-                                    self.model.image_newline[None].to(image_feature.device)
-                                ), dim=0)
-                            new_image_features.append(image_feature)      
-                        elif mm_newline_position == "no_token":
-                            new_image_features.append(image_feature.flatten(0, 1))
-                        else:
-                            raise ValueError(f"Unexpected mm_newline_position: {mm_newline_position}")
-                    elif image_feature.shape[0] > 1:  # multi patches and multi images operations
-                        # rank0_print("Single-images")
-                        base_image_feature = image_feature[0]
-                        image_feature = image_feature[1:]
-                        height = width = self.get_vision_tower().num_patches_per_side
-                        assert height * width == base_image_feature.shape[0]
-
-                        if "anyres_max" in image_aspect_ratio:
-                            matched_anyres_max_num_patches = re.match(r"anyres_max_(\d+)", image_aspect_ratio)
-                            if matched_anyres_max_num_patches:
-                                max_num_patches = int(matched_anyres_max_num_patches.group(1))
-
-                        if image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
-                            if hasattr(self.get_vision_tower(), "image_size"):
-                                vision_tower_image_size = self.get_vision_tower().image_size
-                            else:
-                                raise ValueError("vision_tower_image_size is not found in the vision tower.")
-                            try:
-                                num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, vision_tower_image_size)
-                            except Exception as e:
-                                rank0_print(f"Error: {e}")
-                                num_patch_width, num_patch_height = 2, 2
-                            image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
-                        else:
-                            image_feature = image_feature.view(2, 2, height, width, -1)
-
-                        if "maxpool2x2" in mm_patch_merge_type:
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = nn.functional.max_pool2d(image_feature, 2)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        elif "unpad" in mm_patch_merge_type and "anyres_max" in image_aspect_ratio and matched_anyres_max_num_patches:
-                            unit = image_feature.shape[2]
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
-                            c, h, w = image_feature.shape
-                            times = math.sqrt(h * w / (max_num_patches * unit**2))
-                            if times > 1.1:
-                                image_feature = image_feature[None]
-                                image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
-                            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        elif "unpad" in mm_patch_merge_type:
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
-                            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        else:
-                            image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
-                            image_feature = image_feature.flatten(0, 3)
-                        if "nobase" in mm_patch_merge_type:
-                            pass
-                        else:
-                            image_feature = torch.cat((base_image_feature, image_feature), dim=0)
-                        new_image_features.append(image_feature)
-                    else:  # single image operations
-                        image_feature = image_feature[0]
-                        if "unpad" in mm_patch_merge_type:
-                            image_feature = torch.cat((image_feature, self.model.image_newline[None]), dim=0)
-
-                        new_image_features.append(image_feature)
-                image_features = new_image_features
-            else:
-                raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
+        if getattr(self.config, "use_jepa_only", False):
+            # JEPA-only path: build visual tokens from JEPA features alone, skipping SigLIP.
+            if input_ids.shape[1] == 1:
+                return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None
+            image_features = self.encode_jepa_only(video_dict)
         else:
-            image_features = self.encode_images(images)
+            vision_tower = self.get_vision_tower()
+            # rank_print(modalities)
+            if vision_tower is None or images is None or input_ids.shape[1] == 1:
+                return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None
+
+            if isinstance(modalities, str):
+                modalities = [modalities]
+
+            # import pdb; pdb.set_trace()
+            if type(images) is list or images.ndim == 5:
+                if type(images) is list:
+                    images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
+
+                video_idx_in_batch = []
+                for _ in range(len(modalities)):
+                    if modalities[_] == "video":
+                        video_idx_in_batch.append(_)
+
+                images_list = []
+                for image in images:
+                    if image.ndim == 4:
+                        images_list.append(image)
+                    else:
+                        images_list.append(image.unsqueeze(0))
+
+                concat_images = torch.cat([image for image in images_list], dim=0)
+                split_sizes = [image.shape[0] for image in images_list]
+                encoded_image_features = self.encode_images(concat_images)
+
+                # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
+
+                # This is a list, each element is [num_images, patch * patch, dim]
+                # rank_print(f"Concat images : {concat_images.shape}")
+                encoded_image_features = torch.split(encoded_image_features, split_sizes)
+                image_features = []
+                for idx, image_feat in enumerate(encoded_image_features):
+                    if idx in video_idx_in_batch:
+                        image_features.append(self.get_2dPool(image_feat))
+                    else:
+                        image_features.append(image_feat)
+                # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
+                # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
+                # image_features = torch.split(image_features, split_sizes, dim=0)
+                mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
+                image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
+                mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
+
+                if use_object_proposals:
+                    object_features = []
+                    valid_obj_num = 0
+                    for l in range(obj_num):
+                        # print(f"image_featurs: {image_features[0].shape}")
+                        # print(f"object_patch: {object_patch[l].shape}")
+                        if "patch27" in self.config.object_feature_type:
+                            cur_object_features = image_features[0][object_patch[l].view(-1, 196)]
+                        elif "patch14" in self.config.object_feature_type:
+                            cur_object_features = encoded_image_features[0][object_patch[l].view(-1, 729)]
+                        else:
+                            raise NotImplementedError
+
+                        if len(cur_object_features) == 0:
+                            cur_object_features = torch.zeros(image_features[0].shape[-1]).to(image_features[0].device)
+                        else:
+                            cur_object_features = cur_object_features.mean(dim=0)
+                            valid_obj_num += 1
+                        object_features.append(cur_object_features)
+                    object_features = torch.stack(object_features)
+                    if use_mlp_pe or use_sin3d_pe:
+                        box_center_features = self.get_model().world_position_embedding(object_boxes_center.unsqueeze(0)).squeeze(0)
+                        object_features += box_center_features
+                else:
+                    object_features =  None
+
+
+                if use_sin3d_pe or use_mlp_pe:
+                    new_image_features = []
+                    for idx, image_feat in enumerate(image_features):
+                        if "discrete" in self.config.world_position_embedding_type:
+                            coords = world_coords_discrete[idx].flatten(1, 2)
+                        else:
+                            coords = world_coords[idx].flatten(1, 2)
+
+
+                        image_feat = image_feat + self.get_model().world_position_embedding(coords.detach())
+                        new_image_features.append(image_feat)
+                    image_features = new_image_features
+
+                image_features = self.apply_jepa_patch_adapter(image_features, video_dict)
+
+                if mm_patch_merge_type == "flat":
+                    image_features = [x.flatten(0, 1) for x in image_features]
+
+                elif mm_patch_merge_type.startswith("spatial"):
+                    new_image_features = []
+                    for image_idx, image_feature in enumerate(image_features):
+                        # FIXME: now assume the image is square, and split to 2x2 patches
+                        # num_patches = h * w, where h = w = sqrt(num_patches)
+                        # currently image_feature is a tensor of shape (4, num_patches, hidden_size)
+                        # we want to first unflatten it to (2, 2, h, w, hidden_size)
+                        # rank0_print("At least we are reaching here")
+                        # import pdb; pdb.set_trace()
+                        if image_idx in video_idx_in_batch:  # video operations
+                            # rank0_print("Video")
+                            if mm_newline_position == "grid":
+                                # Grid-wise
+                                image_feature = self.add_token_per_grid(image_feature)
+                                if getattr(self.config, "add_faster_video", False):
+                                    faster_video_feature = self.add_token_per_grid(all_faster_video_features[image_idx])
+                                    # Add a token for each frame
+                                    concat_slow_fater_token = []
+                                    # import pdb; pdb.set_trace()
+                                    for _ in range(image_feature.shape[0]):
+                                        if _ % self.config.faster_token_stride == 0:
+                                            concat_slow_fater_token.append(torch.cat((image_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
+                                        else:
+                                            concat_slow_fater_token.append(torch.cat((faster_video_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
+                                    # import pdb; pdb.set_trace()
+                                    image_feature = torch.cat(concat_slow_fater_token)
+
+                                    # print("!!!!!!!!!!!!")
+
+                                new_image_features.append(image_feature)
+                            elif mm_newline_position == "frame":
+                                # Frame-wise
+                                image_feature = self.add_token_per_frame(image_feature)
+
+                                new_image_features.append(image_feature.flatten(0, 1))
+
+                            elif mm_newline_position == "one_token":
+                                # one-token
+                                image_feature = image_feature.flatten(0, 1)
+                                if 'unpad' in mm_patch_merge_type:
+                                    image_feature = torch.cat((
+                                        image_feature,
+                                        self.model.image_newline[None].to(image_feature.device)
+                                    ), dim=0)
+                                new_image_features.append(image_feature)
+                            elif mm_newline_position == "no_token":
+                                new_image_features.append(image_feature.flatten(0, 1))
+                            else:
+                                raise ValueError(f"Unexpected mm_newline_position: {mm_newline_position}")
+                        elif image_feature.shape[0] > 1:  # multi patches and multi images operations
+                            # rank0_print("Single-images")
+                            base_image_feature = image_feature[0]
+                            image_feature = image_feature[1:]
+                            height = width = self.get_vision_tower().num_patches_per_side
+                            assert height * width == base_image_feature.shape[0]
+
+                            if "anyres_max" in image_aspect_ratio:
+                                matched_anyres_max_num_patches = re.match(r"anyres_max_(\d+)", image_aspect_ratio)
+                                if matched_anyres_max_num_patches:
+                                    max_num_patches = int(matched_anyres_max_num_patches.group(1))
+
+                            if image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
+                                if hasattr(self.get_vision_tower(), "image_size"):
+                                    vision_tower_image_size = self.get_vision_tower().image_size
+                                else:
+                                    raise ValueError("vision_tower_image_size is not found in the vision tower.")
+                                try:
+                                    num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, vision_tower_image_size)
+                                except Exception as e:
+                                    rank0_print(f"Error: {e}")
+                                    num_patch_width, num_patch_height = 2, 2
+                                image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+                            else:
+                                image_feature = image_feature.view(2, 2, height, width, -1)
+
+                            if "maxpool2x2" in mm_patch_merge_type:
+                                image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                                image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                                image_feature = nn.functional.max_pool2d(image_feature, 2)
+                                image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                            elif "unpad" in mm_patch_merge_type and "anyres_max" in image_aspect_ratio and matched_anyres_max_num_patches:
+                                unit = image_feature.shape[2]
+                                image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                                image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                                image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                                c, h, w = image_feature.shape
+                                times = math.sqrt(h * w / (max_num_patches * unit**2))
+                                if times > 1.1:
+                                    image_feature = image_feature[None]
+                                    image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
+                                image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+                                image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                            elif "unpad" in mm_patch_merge_type:
+                                image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                                image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                                image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                                image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+                                image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                            else:
+                                image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
+                                image_feature = image_feature.flatten(0, 3)
+                            if "nobase" in mm_patch_merge_type:
+                                pass
+                            else:
+                                image_feature = torch.cat((base_image_feature, image_feature), dim=0)
+                            new_image_features.append(image_feature)
+                        else:  # single image operations
+                            image_feature = image_feature[0]
+                            if "unpad" in mm_patch_merge_type:
+                                image_feature = torch.cat((image_feature, self.model.image_newline[None]), dim=0)
+
+                            new_image_features.append(image_feature)
+                    image_features = new_image_features
+                else:
+                    raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
+            else:
+                image_features = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
