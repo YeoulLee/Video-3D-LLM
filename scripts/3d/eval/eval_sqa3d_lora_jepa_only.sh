@@ -6,6 +6,9 @@
 
 export python3WARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
+# Uncomment the next line to make CUDA errors synchronous and reveal the actual stack trace
+# (slows down eval significantly — only use for debugging illegal memory access errors).
+# export CUDA_LAUNCH_BLOCKING=1
 
 # Usage: sh scripts/3d/eval/eval_sqa3d_lora_jepa_only.sh <ckpt_dir_under_./ckpt> <frame_sampling_strategy> <max_frame_num>
 # Example: sh scripts/3d/eval/eval_sqa3d_lora_jepa_only.sh llavanext-qwen-video3dllm-sqa3d-lora-jepaonly uniform 32

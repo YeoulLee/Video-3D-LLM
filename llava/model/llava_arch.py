@@ -127,7 +127,9 @@ class JEPATransformerProjector(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        # enable_nested_tensor=False avoids the PyTorch 2.x fast-path (nested tensor)
+        # which has a known illegal-memory-access bug with batch_first + fp16 inputs.
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, enable_nested_tensor=False)
 
     def forward(self, point_features, point_coord_pe, view_token_pe=None):
         """
@@ -381,26 +383,42 @@ class LlavaMetaForCausalLM(ABC):
                     "set --world_position_embedding_type to a sin3d/mlp variant."
                 )
 
+            target_dtype = projector.point_proj.weight.dtype
+
             wpe_type = getattr(self.config, "world_position_embedding_type", "")
             if "discrete" in wpe_type:
-                B = jepa_coords.shape[0]
-                xyz_min = jepa_coords.view(B, -1, 3).min(dim=1)[0]
+                # discrete_coords clamps to config range; do it in fp32 to avoid fp16 rounding
+                jepa_coords_fp = jepa_coords.float()
+                B = jepa_coords_fp.shape[0]
                 coords_for_pe = torch.stack(
-                    [self.discrete_coords(jepa_coords[b], xyz_min[b]) for b in range(B)]
+                    [self.discrete_coords(jepa_coords_fp[b], None) for b in range(B)]
                 )
             else:
-                coords_for_pe = jepa_coords
-            coord_pe = wpe_module(coords_for_pe.detach())   # (B, N, hidden)
+                coords_for_pe = jepa_coords.float()
+            coord_pe = wpe_module(coords_for_pe.detach()).to(target_dtype)   # (B, N, hidden)
 
             view_token_pe = None
             box_input = video_dict.get("box_input")
             if box_input is not None and len(box_input) > 0:
-                anchor = box_input
+                anchor = box_input.float()
                 if "discrete" in wpe_type:
                     anchor = self.discrete_coords(anchor, None)
-                view_token_pe = wpe_module(anchor.unsqueeze(1).detach()).squeeze(1)  # (B, hidden)
+                view_token_pe = wpe_module(anchor.unsqueeze(1).detach()).squeeze(1).to(target_dtype)  # (B, hidden)
 
-            projected = projector(jepa_features, coord_pe, view_token_pe=view_token_pe)
+            jepa_features_cast = jepa_features.to(target_dtype)
+
+            if not getattr(self, "_jepa_diag_done", False):
+                rank0_print(
+                    f"[JEPA-only diag] features={tuple(jepa_features_cast.shape)} {jepa_features_cast.dtype} "
+                    f"coords={tuple(jepa_coords.shape)} {jepa_coords.dtype} "
+                    f"coord_pe={tuple(coord_pe.shape)} {coord_pe.dtype} "
+                    f"view_token_pe={'None' if view_token_pe is None else tuple(view_token_pe.shape)} "
+                    f"feat_finite={torch.isfinite(jepa_features_cast).all().item()} "
+                    f"pe_finite={torch.isfinite(coord_pe).all().item()}"
+                )
+                self._jepa_diag_done = True
+
+            projected = projector(jepa_features_cast, coord_pe, view_token_pe=view_token_pe)
         else:
             projected = projector(jepa_features, jepa_coords)
 
@@ -571,6 +589,7 @@ class LlavaMetaForCausalLM(ABC):
         
 
         object_boxes = None
+        object_features = None
         if use_object_proposals:
             object_boxes = video_dict["objects"][0]
             object_boxes_center = object_boxes[:, :3]
