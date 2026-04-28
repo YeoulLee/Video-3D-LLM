@@ -115,17 +115,63 @@ def eval_model(questions, args):
         model = PeftModel.from_pretrained(model, args.lora_path, adapter_name="lora")
         model = model.merge_and_unload()
         state_dict = torch.load(os.path.join(args.lora_path, 'non_lora_trainables.bin'), map_location="cpu")
+
         # NaN/Inf check on the saved weights themselves (training divergence safeguard).
         nan_keys = [k for k, v in state_dict.items() if torch.is_floating_point(v) and not torch.isfinite(v).all().item()]
         if nan_keys:
             print(f"[non_lora_trainables] WARNING - saved tensors with NaN/Inf: {nan_keys[:10]}{' ...' if len(nan_keys) > 10 else ''}")
-            print(f"[non_lora_trainables] If 'jepa_projector' keys appear above, the trained ckpt itself is corrupted; use an earlier checkpoint.")
-        # Strip PEFT prefixes so the keys line up with merged model's attribute paths.
-        # Training saves keys like "base_model.model.model.jepa_projector.point_proj.weight";
-        # after merge_and_unload, the live model expects "model.jepa_projector.point_proj.weight".
-        state_dict = {(k[len("base_model."):] if k.startswith("base_model.") else k): v for k, v in state_dict.items()}
-        if any(k.startswith("model.model.") for k in state_dict):
-            state_dict = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in state_dict.items()}
+
+        # ----- Robust prefix remapping -----
+        # Different PEFT versions / save paths produce different key prefixes (e.g.
+        # "base_model.model.model.X", "base_model.model.X", "X"). Instead of guessing,
+        # we look up each saved key against the live model's parameter paths by
+        # progressively stripping prefixes and trying both with and without "model.".
+        target_keys = set(model.state_dict().keys())
+
+        # Diagnostic: show the actual saved key shape so we can see what prefix exists.
+        sample_saved = list(state_dict.keys())[:3]
+        sample_jepa_saved = [k for k in state_dict.keys() if "jepa_projector" in k][:3]
+        sample_jepa_target = [k for k in target_keys if "jepa_projector" in k][:3]
+        print(f"[non_lora_trainables] sample saved keys: {sample_saved}")
+        print(f"[non_lora_trainables] saved keys containing 'jepa_projector' ({sum(1 for k in state_dict if 'jepa_projector' in k)}): {sample_jepa_saved}")
+        print(f"[non_lora_trainables] live model jepa_projector keys ({sum(1 for k in target_keys if 'jepa_projector' in k)}): {sample_jepa_target}")
+
+        def _candidates(k):
+            """Yield possible normalized names for a saved key."""
+            yield k
+            stripped_once = None
+            for prefix in ("base_model.model.", "base_model.", "module.model.", "module."):
+                if k.startswith(prefix):
+                    stripped_once = k[len(prefix):]
+                    yield stripped_once
+                    if not stripped_once.startswith("model."):
+                        yield "model." + stripped_once
+                    break
+            # Also handle the "model.model." double prefix when no PEFT prefix:
+            if k.startswith("model.model."):
+                yield k[len("model."):]
+            # And try just adding "model." in case the saved key omits it.
+            if not k.startswith("model."):
+                yield "model." + k
+
+        remapped = {}
+        unmatched_saved = []
+        for k, v in state_dict.items():
+            chosen = None
+            for cand in _candidates(k):
+                if cand in target_keys:
+                    chosen = cand
+                    break
+            if chosen is None:
+                unmatched_saved.append(k)
+                remapped[k] = v   # keep original; will be unexpected
+            else:
+                remapped[chosen] = v
+        state_dict = remapped
+
+        if unmatched_saved:
+            print(f"[non_lora_trainables] could not map {len(unmatched_saved)} saved keys to live model. Examples: {unmatched_saved[:5]}")
+
         # Cast to the live model's dtype so bf16-trained tensors match an fp16/bf16 model.
         state_dict = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in state_dict.items()}
         msg = model.load_state_dict(state_dict, strict=False)
