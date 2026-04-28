@@ -120,6 +120,12 @@ def eval_model(questions, args):
         if nan_keys:
             print(f"[non_lora_trainables] WARNING - saved tensors with NaN/Inf: {nan_keys[:10]}{' ...' if len(nan_keys) > 10 else ''}")
             print(f"[non_lora_trainables] If 'jepa_projector' keys appear above, the trained ckpt itself is corrupted; use an earlier checkpoint.")
+        # Strip PEFT prefixes so the keys line up with merged model's attribute paths.
+        # Training saves keys like "base_model.model.model.jepa_projector.point_proj.weight";
+        # after merge_and_unload, the live model expects "model.jepa_projector.point_proj.weight".
+        state_dict = {(k[len("base_model."):] if k.startswith("base_model.") else k): v for k, v in state_dict.items()}
+        if any(k.startswith("model.model.") for k in state_dict):
+            state_dict = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in state_dict.items()}
         # Cast to the live model's dtype so bf16-trained tensors match an fp16/bf16 model.
         state_dict = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in state_dict.items()}
         msg = model.load_state_dict(state_dict, strict=False)
