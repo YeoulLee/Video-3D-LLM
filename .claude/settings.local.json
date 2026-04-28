@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('llava/model/llava_arch.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "PowerShell(python -c \"import ast; ast.parse\\(open\\('llava/model/llava_arch.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "PowerShell(python -c \"import ast; ast.parse\\(open\\('llava/train/train_3d.py'\\).read\\(\\)\\); ast.parse\\(open\\('llava/eval/model_sqa3d.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('llava/train/train_3d.py'\\).read\\(\\)\\); ast.parse\\(open\\('llava/eval/model_sqa3d.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('../Video-3D-LLM-jepa/llava/model/llava_arch.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

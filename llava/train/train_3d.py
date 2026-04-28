@@ -1806,14 +1806,19 @@ def train(attn_implementation=None):
         if training_args.lora_enable:
             # We update embed_tokens as the size of embedding has changed.
             # jepa_patch_adapter / jepa_projector are fully fine-tuned in LoRA mode (not LoRA targets).
+            unfreeze_counts = {"embed_tokens": 0, "lora_": 0, "jepa_patch_adapter": 0, "jepa_projector": 0}
             for name, param in model.named_parameters():
-                if (
-                    "embed_tokens" in name
-                    or "lora_" in name
-                    or "jepa_patch_adapter" in name
-                    or "jepa_projector" in name
-                ):
-                    param.requires_grad_(True)
+                for tag in unfreeze_counts:
+                    if tag in name:
+                        param.requires_grad_(True)
+                        unfreeze_counts[tag] += 1
+                        break
+            rank0_print(f"[unfreeze] LoRA-mode unfrozen counts: {unfreeze_counts}")
+            jepa_proj_params = [n for n, _ in model.named_parameters() if "jepa_projector" in n]
+            if jepa_proj_params:
+                rank0_print(f"[unfreeze] jepa_projector sample names: {jepa_proj_params[:3]}")
+            else:
+                rank0_print("[unfreeze] WARNING: no parameter containing 'jepa_projector' found in model")
             # Honor mm_tunable_parts in LoRA mode for non-LLM modules.
             # mm_language_model is intentionally skipped here since LoRA already covers the LLM linears.
             if model_args.mm_tunable_parts is not None:
