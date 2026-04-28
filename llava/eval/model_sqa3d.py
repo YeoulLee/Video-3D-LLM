@@ -98,7 +98,13 @@ def eval_model(questions, args):
             "vocab_size": 151649
         })
 
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, overwrite_config=config)
+    # Match the training dtype (bfloat16). fp16 inference can overflow LayerNorm
+    # variance when bf16-trained weights/activations are cast to fp16's narrower range.
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        model_path, args.model_base, model_name,
+        overwrite_config=config,
+        torch_dtype="bfloat16",
+    )
 
     if args.lora_path is not None:
         from transformers import AutoTokenizer
@@ -201,9 +207,10 @@ def eval_model(questions, args):
                 print(f"[warn] JEPA feature file not found, skipping JEPA adapter for this sample: {jepa_path}")
 
         video_dict = merge_video_dict([video_dict])
-        image_tensors = video_dict.pop('images').half().to(model.device)
+        # Match the model's dtype (now bf16) instead of hard-coding fp16.
+        image_tensors = video_dict.pop('images').to(dtype=model.dtype, device=model.device)
         for k in video_dict:
-            video_dict[k] = video_dict[k].half().to(model.device)
+            video_dict[k] = video_dict[k].to(dtype=model.dtype, device=model.device)
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
         keywords = [stop_str]
