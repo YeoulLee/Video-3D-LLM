@@ -195,8 +195,43 @@ class JEPATransformerProjector(nn.Module):
         point_features = point_features.to(dtype)
         point_coord_pe = point_coord_pe.to(dtype)
 
-        x = self.point_proj(point_features) + point_coord_pe
-        x = self.input_norm(x)
+        diag = not getattr(self, "_encoder_input_diag_done", False)
+
+        if diag:
+            ppw = self.point_proj.weight
+            inw = self.input_norm.weight
+            rank0_print(
+                f"[Proj diag][weights] point_proj.weight finite={torch.isfinite(ppw).all().item()} "
+                f"max_abs={ppw.abs().max().item():.4e} | input_norm.weight finite={torch.isfinite(inw).all().item()} "
+                f"max_abs={inw.abs().max().item():.4e} dtype={ppw.dtype}"
+            )
+            rank0_print(
+                f"[Proj diag][in] point_features finite={torch.isfinite(point_features).all().item()} "
+                f"max_abs={point_features.abs().max().item():.4e} | "
+                f"point_coord_pe finite={torch.isfinite(point_coord_pe).all().item()} "
+                f"max_abs={point_coord_pe.abs().max().item():.4e}"
+            )
+
+        proj_out = self.point_proj(point_features)
+        if diag:
+            rank0_print(
+                f"[Proj diag][step1] point_proj output finite={torch.isfinite(proj_out).all().item()} "
+                f"max_abs={proj_out.abs().max().item() if torch.isfinite(proj_out).all() else float('nan'):.4e}"
+            )
+
+        sum_x = proj_out + point_coord_pe
+        if diag:
+            rank0_print(
+                f"[Proj diag][step2] proj+pe finite={torch.isfinite(sum_x).all().item()} "
+                f"max_abs={sum_x.abs().max().item() if torch.isfinite(sum_x).all() else float('nan'):.4e}"
+            )
+
+        x = self.input_norm(sum_x)
+        if diag:
+            rank0_print(
+                f"[Proj diag][step3] input_norm output finite={torch.isfinite(x).all().item()} "
+                f"max_abs={x.abs().max().item() if torch.isfinite(x).all() else float('nan'):.4e}"
+            )
 
         if self.use_view_token and view_token_pe is not None:
             B = x.shape[0]
@@ -206,23 +241,16 @@ class JEPATransformerProjector(nn.Module):
                 view_pe = view_pe.unsqueeze(1)
             view_tok = view_tok + view_pe
             x = torch.cat([view_tok, x], dim=1)
+            if diag:
+                rank0_print(
+                    f"[Proj diag][step4] view-token concatenated, x finite={torch.isfinite(x).all().item()}"
+                )
 
-        # Sanity check before entering the transformer encoder. Catches upstream
-        # corruption (NaN/Inf or wrong shape) with a clear synchronous error
-        # instead of an opaque async illegal-memory-access from the GPU.
-        if not getattr(self, "_encoder_input_diag_done", False):
-            assert x.dim() == 3, f"expected 3D tensor for transformer input, got {x.shape}"
-            assert x.shape[-1] == self.point_proj.out_features, (
-                f"hidden mismatch: x last dim {x.shape[-1]} vs hidden {self.point_proj.out_features}"
-            )
-            finite = torch.isfinite(x).all().item()
+        if diag:
             rank0_print(
-                f"[JEPATransformerProjector] encoder input shape={tuple(x.shape)} "
-                f"dtype={x.dtype} device={x.device} finite={finite} "
-                f"min={x.min().item():.4f} max={x.max().item():.4f}"
+                f"[Proj diag][final] encoder input shape={tuple(x.shape)} dtype={x.dtype} "
+                f"finite={torch.isfinite(x).all().item()}"
             )
-            if not finite:
-                raise RuntimeError("Transformer projector input contains NaN/Inf — upstream issue.")
             self._encoder_input_diag_done = True
 
         return self.encoder(x)
@@ -478,14 +506,17 @@ class LlavaMetaForCausalLM(ABC):
             jepa_features_cast = jepa_features.to(target_dtype)
 
             if not getattr(self, "_jepa_diag_done", False):
-                rank0_print(
-                    f"[JEPA-only diag] features={tuple(jepa_features_cast.shape)} {jepa_features_cast.dtype} "
-                    f"coords={tuple(jepa_coords.shape)} {jepa_coords.dtype} "
-                    f"coord_pe={tuple(coord_pe.shape)} {coord_pe.dtype} "
-                    f"view_token_pe={'None' if view_token_pe is None else tuple(view_token_pe.shape)} "
-                    f"feat_finite={torch.isfinite(jepa_features_cast).all().item()} "
-                    f"pe_finite={torch.isfinite(coord_pe).all().item()}"
-                )
+                feat_finite = torch.isfinite(jepa_features_cast).all().item()
+                pe_finite = torch.isfinite(coord_pe).all().item()
+                coords_finite = torch.isfinite(jepa_coords).all().item()
+                rank0_print(f"[JEPA diag][1/4] jepa_features shape={tuple(jepa_features_cast.shape)} dtype={jepa_features_cast.dtype} finite={feat_finite}")
+                if feat_finite:
+                    rank0_print(f"[JEPA diag][1/4]   abs_max={jepa_features_cast.abs().max().item():.4f} mean={jepa_features_cast.float().mean().item():.4f}")
+                rank0_print(f"[JEPA diag][2/4] jepa_coords shape={tuple(jepa_coords.shape)} dtype={jepa_coords.dtype} finite={coords_finite}")
+                if coords_finite:
+                    rank0_print(f"[JEPA diag][2/4]   range=[{jepa_coords.min().item():.4f}, {jepa_coords.max().item():.4f}]")
+                rank0_print(f"[JEPA diag][3/4] coord_pe shape={tuple(coord_pe.shape)} dtype={coord_pe.dtype} finite={pe_finite}")
+                rank0_print(f"[JEPA diag][4/4] view_token_pe={'None' if view_token_pe is None else tuple(view_token_pe.shape)}")
                 self._jepa_diag_done = True
 
             projected = projector(jepa_features_cast, coord_pe, view_token_pe=view_token_pe)

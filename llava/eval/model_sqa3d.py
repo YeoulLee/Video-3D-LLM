@@ -115,6 +115,11 @@ def eval_model(questions, args):
         model = PeftModel.from_pretrained(model, args.lora_path, adapter_name="lora")
         model = model.merge_and_unload()
         state_dict = torch.load(os.path.join(args.lora_path, 'non_lora_trainables.bin'), map_location="cpu")
+        # NaN/Inf check on the saved weights themselves (training divergence safeguard).
+        nan_keys = [k for k, v in state_dict.items() if torch.is_floating_point(v) and not torch.isfinite(v).all().item()]
+        if nan_keys:
+            print(f"[non_lora_trainables] WARNING - saved tensors with NaN/Inf: {nan_keys[:10]}{' ...' if len(nan_keys) > 10 else ''}")
+            print(f"[non_lora_trainables] If 'jepa_projector' keys appear above, the trained ckpt itself is corrupted; use an earlier checkpoint.")
         # Cast to the live model's dtype so bf16-trained tensors match an fp16/bf16 model.
         state_dict = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in state_dict.items()}
         msg = model.load_state_dict(state_dict, strict=False)
