@@ -112,11 +112,18 @@ class SafeTransformerEncoderLayer(nn.TransformerEncoderLayer):
         Hd = D // H
         qkv = F.linear(x, self.self_attn.in_proj_weight, self.self_attn.in_proj_bias)
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, N, H, Hd).transpose(1, 2)
+        q = q.view(B, N, H, Hd).transpose(1, 2)   # (B, H, N, Hd)
         k = k.view(B, N, H, Hd).transpose(1, 2)
         v = v.view(B, N, H, Hd).transpose(1, 2)
-        dropout_p = self.self_attn.dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+
+        # Pure-python attention (no SDPA / no fast path) — safest for non-standard
+        # head_dim values like 448 (= 3584 / 8) where SDPA backends behave oddly.
+        scale = 1.0 / math.sqrt(Hd)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale   # (B, H, N, N)
+        attn = attn.softmax(dim=-1)
+        if self.training and self.self_attn.dropout > 0:
+            attn = F.dropout(attn, p=self.self_attn.dropout)
+        out = torch.matmul(attn, v)   # (B, H, N, Hd)
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.self_attn.out_proj(out)
 
@@ -199,6 +206,24 @@ class JEPATransformerProjector(nn.Module):
                 view_pe = view_pe.unsqueeze(1)
             view_tok = view_tok + view_pe
             x = torch.cat([view_tok, x], dim=1)
+
+        # Sanity check before entering the transformer encoder. Catches upstream
+        # corruption (NaN/Inf or wrong shape) with a clear synchronous error
+        # instead of an opaque async illegal-memory-access from the GPU.
+        if not getattr(self, "_encoder_input_diag_done", False):
+            assert x.dim() == 3, f"expected 3D tensor for transformer input, got {x.shape}"
+            assert x.shape[-1] == self.point_proj.out_features, (
+                f"hidden mismatch: x last dim {x.shape[-1]} vs hidden {self.point_proj.out_features}"
+            )
+            finite = torch.isfinite(x).all().item()
+            rank0_print(
+                f"[JEPATransformerProjector] encoder input shape={tuple(x.shape)} "
+                f"dtype={x.dtype} device={x.device} finite={finite} "
+                f"min={x.min().item():.4f} max={x.max().item():.4f}"
+            )
+            if not finite:
+                raise RuntimeError("Transformer projector input contains NaN/Inf — upstream issue.")
+            self._encoder_input_diag_done = True
 
         return self.encoder(x)
 
