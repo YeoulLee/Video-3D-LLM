@@ -20,6 +20,7 @@ import re
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
@@ -90,6 +91,50 @@ class JEPAOnlyProjector(nn.Module):
         return self.point_proj(point_features) + self.coord_proj(point_coords)
 
 
+class SafeTransformerEncoderLayer(nn.TransformerEncoderLayer):
+    """nn.TransformerEncoderLayer subclass that always takes the explicit Python path.
+
+    The default ``forward`` of TransformerEncoderLayer can dispatch to the fused
+    C++ kernel ``torch._transformer_encoder_layer_fwd`` whenever its long list
+    of preconditions holds. That kernel has hit ``CUDA error: an illegal memory
+    access`` on fp16 inference paths in PyTorch 2.x. We override ``forward`` to
+    skip the fused kernel entirely, and re-implement self-attention via
+    ``F.scaled_dot_product_attention`` so we also avoid ``MultiheadAttention``'s
+    own ``torch._native_multi_head_attention`` fast path.
+
+    Submodule names (``self_attn``, ``linear1``, ``linear2``, ``norm1``, ``norm2``)
+    are inherited unchanged so existing checkpoints load without renaming.
+    """
+
+    def _safe_self_attn(self, x):
+        B, N, D = x.shape
+        H = self.self_attn.num_heads
+        Hd = D // H
+        qkv = F.linear(x, self.self_attn.in_proj_weight, self.self_attn.in_proj_bias)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, N, H, Hd).transpose(1, 2)
+        k = k.view(B, N, H, Hd).transpose(1, 2)
+        v = v.view(B, N, H, Hd).transpose(1, 2)
+        dropout_p = self.self_attn.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        out = out.transpose(1, 2).contiguous().view(B, N, D)
+        return self.self_attn.out_proj(out)
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
+        x = src
+        if self.norm_first:
+            x = x + self.dropout1(self._safe_self_attn(self.norm1(x)))
+            h = self.norm2(x)
+            h = self.linear2(self.dropout(self.activation(self.linear1(h))))
+            x = x + self.dropout2(h)
+        else:
+            attn_out = self._safe_self_attn(x)
+            x = self.norm1(x + self.dropout1(attn_out))
+            h = self.linear2(self.dropout(self.activation(self.linear1(x))))
+            x = self.norm2(x + self.dropout2(h))
+        return x
+
+
 class JEPATransformerProjector(nn.Module):
     """Transformer-based JEPA projector with self-attention across points.
 
@@ -118,7 +163,7 @@ class JEPATransformerProjector(nn.Module):
         if use_view_token:
             self.view_query = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
 
-        layer = nn.TransformerEncoderLayer(
+        layer = SafeTransformerEncoderLayer(
             d_model=hidden_size,
             nhead=num_heads,
             dim_feedforward=ffn_mult * hidden_size,
@@ -127,8 +172,8 @@ class JEPATransformerProjector(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        # enable_nested_tensor=False avoids the PyTorch 2.x fast-path (nested tensor)
-        # which has a known illegal-memory-access bug with batch_first + fp16 inputs.
+        # SafeTransformerEncoderLayer skips the fused C++ kernel; nested-tensor opt
+        # at the encoder level is also disabled for the same reason.
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, enable_nested_tensor=False)
 
     def forward(self, point_features, point_coord_pe, view_token_pe=None):
